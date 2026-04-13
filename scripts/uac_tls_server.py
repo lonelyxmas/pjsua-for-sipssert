@@ -243,32 +243,29 @@ def main():
         ep = init_endpoint(args, ep=ep)
         app.ep = ep
 
-        # Create TLS transport (TLS server role — listen on listen_port)
-        # TLS is mandatory for this mode (TLS role decoupling)
+        # Prepare account config BEFORE creating transport to minimize
+        # race window — remote side may connect as soon as TLS listener is up
         args.transport = "tls"
-        transport_id = create_transport(ep, args, port=args.listen_port)
-        app.transport_id = transport_id
-        print(f"TLS server: listening on port {args.listen_port}", file=sys.stderr)
-
-        # Create account bound to our TLS listener transport
         acfg = pj.AccountConfig()
         bind_addr = getattr(args, "bind_ip", "") or "0.0.0.0"
         from_user = getattr(args, "from_user", None) or "uac"
         acfg.idUri = f"sip:{from_user}@{bind_addr}:{args.listen_port};transport=tls"
         acfg.regConfig.registrarUri = ""
         acfg.regConfig.registerOnAdd = False
-        # Force account to use our TLS listener transport —
-        # this ensures INVITE goes over the incoming TLS connection
-        acfg.sipConfig.transportId = transport_id
-
         configure_srtp(acfg, args.srtp, args.srtp_secure)
-
         if getattr(args, "rtp_port", 0):
             acfg.mediaConfig.transportConfig.port = args.rtp_port
 
+        # Create TLS transport (TLS server role — listen on listen_port)
+        transport_id = create_transport(ep, args, port=args.listen_port)
+        app.transport_id = transport_id
+
+        # Immediately create account — remote may already be connecting
+        acfg.sipConfig.transportId = transport_id
         account = UacAccount(app)
         account.create(acfg)
         app.account = account
+        print(f"TLS server: listening on port {args.listen_port}", file=sys.stderr)
 
         # Wait for remote TLS client to connect
         tls_wait = getattr(args, "tls_wait", 10)
