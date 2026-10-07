@@ -23,7 +23,7 @@ SIPp (v3.7) has several issues that cannot be resolved without patching the sour
 docker build -t pjsua-test .
 ```
 
-The image is based on Alpine 3.20 with prebuilt `pjproject` 2.14.1 and `py3-yaml` packages — build takes ~5 seconds.
+The image is based on Alpine 3.24 with prebuilt `pjproject` 2.17 and `py3-yaml` packages — build takes ~5 seconds.
 
 ## Operating Modes
 
@@ -634,7 +634,7 @@ All header checks are applied to the INVITE response (200 OK). A failed check re
 
 ```
 .
-├── Dockerfile              # Alpine 3.20 + pjproject/pjsua/py3-pjsua/py3-yaml packages
+├── Dockerfile              # Alpine 3.24 + pjproject/pjsua/py3-pjsua/py3-yaml packages
 ├── entrypoint.sh           # CLI wrapper: parses arguments, launches the appropriate script
 ├── scripts/
 │   ├── common.py           # Shared module: EchoValidatorPort, OptionsPingManager,
@@ -668,6 +668,33 @@ All header checks are applied to the INVITE response (200 OK). A failed check re
   When using stale Docker cache, they may reappear — rebuild with `--no-cache`.
 - **Segfault on exit**: PJSUA2 Python bindings sometimes crash during `libDestroy()`.
   Worked around via `os._exit()` — exit code is correct.
+- **pjproject 2.17 (alpine ≥3.24) teardown**: `libDestroy()` takes ~1.5s and the
+  uas-side `onCallState(DISCONNECTED)` callback arrives ~2s after BYE (on 2.14 —
+  instant). Since sipssert SIGKILLs daemon containers (`docker stop(timeout=0)`)
+  right after the client exits, shutdown must be fast: `wait_call_end()` polls
+  the call state in addition to the event, `safe_shutdown()` skips
+  `hangupAll()`/destroy for an already-disconnected call, and a SIGTERM handler
+  (`install_signal_exit()`) turns `docker stop` into a clean exit 0 — note that
+  PID 1 never receives default-disposition signals, so without the handler the
+  container always dies with 137. Set `stop_timeout: 5` under
+  `defaults: generic:` in the sipssert config so `docker stop` sends SIGTERM
+  first. Two caveats: (1) this requires a sipssert version with
+  defaults-by-type merge (`tasks_list.py` merges `defaults[task_type]`) — on
+  older versions add `stop_timeout: 5` to each daemon task in `scenario.yml`
+  instead; (2) SIGINT (Ctrl+C) is also converted to a silent exit 0 — no
+  KeyboardInterrupt traceback when running the scripts manually.
+- **Test cert validity horizon**: the 9 original scenario `certs/` dirs expire
+  **2027-04-02**; the 5 regenerated ones (bye-from-uas, bye-none, options-ping,
+  reinvite-uac, reinvite-uas) expire **2036**. Around April 2027 the suite
+  will start failing with certificate errors — regenerate uniformly at commit
+  time or beforehand.
+- **In-dialog OPTIONS keepalive (`pjsua-options-ping` scenario) always fails**:
+  pjsua2 cannot answer in-dialog OPTIONS — the dialog rejects the request with
+  `500 Unhandled by dialog usages` (sip_dialog.c) before any app code runs, and
+  pjsua2 exposes neither a callback for incoming in-dialog requests nor an API
+  to respond to one (verified on 2.14.1, 2.17 and master). The
+  `--options-auto-reply` flag is therefore non-functional; real-world PBX
+  keepalives are out-of-dialog, which pjsua answers natively with 200.
 - **Probe INVITE** (`uac-tls-server` mode): uas-tls-client sends a probe INVITE
   to signal TLS connection readiness. uac-tls-server rejects it (486 Busy)
   and then sends the real INVITE.

@@ -14,20 +14,21 @@ Provides:
 
 import argparse
 import collections
+import contextlib
+import importlib.util
 import os
 import re
+import signal
 import struct
 import sys
 import threading
 import time
 
-import pjsua2 as pj
+import pjsua2 as pj  # type: ignore[import-unresolved]  # существует только внутри образа (apk py3-pjsua)
 
-try:
-    import yaml
-    _YAML_AVAILABLE = True
-except ImportError:
-    _YAML_AVAILABLE = False
+# доступность PyYAML тестируем через find_spec (без исполнения модуля);
+# сам import выполняется локально в ConfigLoader.load
+_YAML_AVAILABLE = importlib.util.find_spec("yaml") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,6 @@ def _build_ulaw_quantize_table():
     Each value is the result of lin16→μ-law→lin16 round-trip.
     Patterns built from these values survive G.711 PCMU encode/decode unchanged.
     """
-    ULAW_MAX = 0x1FFF  # 8159
     BIAS = 0x84        # 132
 
     def _lin16_to_ulaw(sample):
@@ -93,7 +93,6 @@ def _build_stable_values():
     seen = set()
     values = []
     for ulaw_byte in range(256):
-        pcm = _ULAW_QUANTIZE.get(0, 0)  # dummy, we decode directly
         # Decode μ-law byte directly to get a stable value
         b = ~ulaw_byte & 0xFF
         sign = b & 0x80
@@ -371,7 +370,9 @@ def parse_sip_headers(whole_msg: str) -> list:
         # Continuation line (header folding)
         if line and line[0] in (" ", "\t"):
             if current_name is not None:
-                current_value = current_value + " " + line.strip()
+                # current_value не может быть None при заданном имени (ветка
+                # недостижима для корректного SIP); "or \"\"" — guard для анализатора
+                current_value = (current_value or "") + " " + line.strip()
             continue
 
         # Save previous header
@@ -569,7 +570,7 @@ class HeaderManager:
                           f"value '{actual_value}' does not match '{expected_value}'")
             else:
                 passed = actual_value == expected_value
-                detail = (f"value matches" if passed else
+                detail = ("value matches" if passed else
                           f"expected '{expected_value}', got '{actual_value}'")
         else:
             # Any value matches
@@ -583,7 +584,7 @@ class HeaderManager:
                           f"no value matches '{expected_value}' in {matching}")
             else:
                 passed = any(v == expected_value for v in matching)
-                detail = (f"value found" if passed else
+                detail = ("value found" if passed else
                           f"value '{expected_value}' not found in {matching}")
 
         return CheckResult(check_type, entry, passed, detail)
@@ -659,8 +660,12 @@ class ConfigLoader:
         """Read YAML file, return dict."""
         if not _YAML_AVAILABLE:
             raise ImportError("PyYAML is not available; cannot load config file.")
-        with open(path, "r") as f:
-            data = yaml.safe_load(f) or {}
+        import yaml  # локальный реимпорт (cache-hit): после guard'а имя гарантированно связано
+        try:
+            with open(path) as f:
+                data = yaml.safe_load(f) or {}
+        except OSError as e:
+            raise OSError(f"Cannot read config file '{path}': {e}") from e
         return data
 
     @staticmethod
@@ -773,15 +778,7 @@ class ConfigLoader:
 
 def _is_default(value) -> bool:
     """Return True if value is considered a default/empty value that config can override."""
-    if value is None:
-        return True
-    if value == "":
-        return True
-    if value is False:
-        return True
-    if value == 0:
-        return True
-    return False
+    return value is None or value == "" or value == 0
 
 
 def _parse_bool(value):
@@ -987,6 +984,33 @@ def configure_tls(tp_cfg: pj.TransportConfig, args: argparse.Namespace):
 # Endpoint helpers
 # ---------------------------------------------------------------------------
 
+def install_signal_exit() -> None:
+    """SIGTERM/SIGINT → мгновенный чистый выход (flush + os._exit(0)).
+
+    Критично для PID 1 контейнера: ядро НЕ доставляет сигналы с
+    default-диспозицией в PID 1, поэтому python без обработчика SIGTERM
+    переживает docker stop и добивается SIGKILL → exit 137. sipssert
+    останавливает daemon-задачи сразу после выхода клиента с
+    stop_timeout из конфига (по умолчанию 0 = сразу SIGKILL); с
+    обработчиком stop превращается в штатный быстрый выход с кодом 0
+    (ревью 2026-10-06: uas-режим на pjproject 2.17 не успевал
+    самостоятельно выйти до SIGKILL — сценарии падали на teardown).
+    """
+    def _handler(signum, frame):
+        # flush только под suppress: EPIPE внутри обработчика унёс бы
+        # исключение наверх и os._exit не выполнился бы
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+        with contextlib.suppress(Exception):
+            sys.stderr.flush()
+        os._exit(0)
+
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGTERM, _handler)
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGINT, _handler)
+
+
 def init_endpoint(args: argparse.Namespace, ep: pj.Endpoint = None) -> pj.Endpoint:
     """Create Endpoint, init, setNullDev, start. Returns endpoint.
 
@@ -1005,16 +1029,38 @@ def init_endpoint(args: argparse.Namespace, ep: pj.Endpoint = None) -> pj.Endpoi
     ep.libInit(ep_cfg)
     ep.audDevManager().setNullDev()
     ep.libStart()
+    install_signal_exit()
     return ep
 
 
-def safe_shutdown(ep: pj.Endpoint, validator=None, account=None):
-    """Hang up all calls, delete refs, destroy library. All errors suppressed."""
-    try:
-        ep.hangupAllCalls()
-        time.sleep(0.5)
-    except Exception:
-        pass
+def safe_shutdown(ep: pj.Endpoint, validator=None, account=None,
+                  destroy_timeout: float = 0.0, hangup: bool = True):
+    """Hang up all calls, delete refs, destroy library. All errors suppressed.
+
+    Завершение должно быть БЫСТРЫМ: sipssert останавливает daemon-контейнер
+    сразу после завершения клиентской задачи с коротким grace — если процесс
+    не выйдет за это окно, контейнер получает SIGKILL (137) и сценарий
+    засчитывается как FAIL (наблюдено 2026-10-06 на pjproject 2.17: там
+    libDestroy занимает ~1.5 c против ~0.1 c на 2.14, и uas перестал
+    укладываться в окно).
+
+    Поэтому по умолчанию destroy ПОЛНОСТЬЮ пропускается (destroy_timeout=0):
+    процесс всё равно завершается через os._exit (safe_exit), который и так
+    пропускает всю pjlib-чистку; hangupAll + короткая пауза дают BYE уйти.
+    Для отладки можно поднять destroy_timeout — destroy пойдёт в отдельном
+    потоке с ограничением времени.
+
+    hangup=False — fast-path для случая, когда вызывающий код УЖЕ знает, что
+    вызов завершён (wait_call_end увидел DISCONNECTED): hangupAll не нужен
+    (активных вызовов нет), а sleep-пауза и hangupAll на pjproject 2.17
+    стоят сотни миллисекунд — ровно то, чего не хватает в гонке teardown.
+    """
+    if hangup:
+        with contextlib.suppress(Exception):
+            ep.hangupAllCalls()
+            # 0.1s, а не 0.5s: см. выше про docker stop(timeout=0); пауза нужна
+            # только чтобы hangupAll (если был) успел уйти в сеть.
+            time.sleep(0.1)
 
     # Drop references to prevent use-after-free
     if validator is not None:
@@ -1022,14 +1068,36 @@ def safe_shutdown(ep: pj.Endpoint, validator=None, account=None):
     if account is not None:
         account = None  # noqa: F841
 
-    try:
+    if destroy_timeout <= 0:
+        return
+
+    destroy_thread = threading.Thread(
+        target=_destroy_library, args=(ep,), daemon=True
+    )
+    destroy_thread.start()
+    destroy_thread.join(destroy_timeout)
+    if destroy_thread.is_alive():
+        print(
+            f"libDestroy did not complete within {destroy_timeout}s — "
+            "forcing exit (os._exit).",
+            file=sys.stderr,
+        )
+
+
+def _destroy_library(ep: pj.Endpoint) -> None:
+    """libDestroy вне главного потока; любые ошибки подавлены.
+    Если pjlib откажет незарегистрированному потоку — исключение подавится
+    и destroy будет пропущен (для os._exit-завершения это эквивалентно)."""
+    with contextlib.suppress(Exception):
         ep.libDestroy()
-    except Exception:
-        pass
 
 
 def safe_exit(rc: int):
     """Exit using os._exit to avoid PJSUA2 cleanup segfaults."""
+    # os._exit не сбрасывает буферы — при быстром выходе теряется хвост логов
+    # (вплоть до блока Echo Validation Results), что ломает разбор логов sipssert.
+    sys.stdout.flush()
+    sys.stderr.flush()
     os._exit(rc)
 
 
@@ -1062,10 +1130,10 @@ def schedule_bye(call, app, role: str):
         timer.start()
         return timer
     elif bye == "none":
-        print(f"BYE=none: will not send BYE.", file=sys.stderr)
+        print("BYE=none: will not send BYE.", file=sys.stderr)
         return None
     else:
-        print(f"Waiting for BYE from remote side.", file=sys.stderr)
+        print("Waiting for BYE from remote side.", file=sys.stderr)
         return None
 
 
@@ -1078,6 +1146,35 @@ def _do_hangup(call, app):
     except Exception as e:
         print(f"Hangup error: {e}", file=sys.stderr)
         app.call_completed.set()
+
+
+def wait_call_end(app, timeout: float) -> bool:
+    """Ждать завершения вызова: событие ИЛИ фактическое состояние вызова.
+
+    На pjproject 2.17 колбэк onCallState(DISCONNECTED) у uas-стороны приходит
+    с задержкой ~2s после BYE (на 2.14 — мгновенно; наблюдено 2026-10-06),
+    а sipssert останавливает daemon-контейнеры docker stop(timeout=0) сразу
+    после завершения клиентской задачи — процесс, ждущий только событие,
+    получает SIGKILL (137) и сценарий падает. Внутреннее состояние pjsua
+    обновляется сразу (RTCP-статистика в логе появляется раньше колбэка),
+    поэтому помимо события опрашываем call.getInfo().state напрямую.
+    """
+    deadline = time.monotonic() + max(timeout, 0)
+    while True:
+        if app.call_completed.wait(0.05):
+            return True
+        call = getattr(app, "active_call", None)
+        if call is not None:
+            with contextlib.suppress(Exception):
+                if call.getInfo().state == pj.PJSIP_INV_STATE_DISCONNECTED:
+                    # вызов уже завершён на уровне pjsua — помечаем, чтобы
+                    # safe_shutdown не тратил время на hangupAll (см. ниже):
+                    # хвост BYE→exit должен быть короче окна teardown sipssert
+                    app.call_already_disconnected = True
+                    app.call_completed.set()
+                    return True
+        if time.monotonic() >= deadline:
+            return app.call_completed.is_set()
 
 
 def wait_for_completion(app, role: str):
@@ -1093,7 +1190,7 @@ def wait_for_completion(app, role: str):
     if bye == role:
         # We send BYE — wait for duration + reasonable margin
         timeout = duration + 30
-        if app.call_completed.wait(timeout=timeout):
+        if wait_call_end(app, timeout):
             print("Call completed.", file=sys.stderr)
             return True
         else:
@@ -1101,7 +1198,7 @@ def wait_for_completion(app, role: str):
             return False
     elif bye == "none":
         # No BYE — just wait for duration (media collection), then exit
-        if app.call_completed.wait(timeout=duration):
+        if wait_call_end(app, duration):
             print("Call completed (unexpected BYE received).", file=sys.stderr)
         else:
             print(f"Duration {duration}s elapsed, no BYE sent (bye=none).",
@@ -1110,7 +1207,7 @@ def wait_for_completion(app, role: str):
     else:
         # Remote sends BYE — wait duration + wait_bye
         timeout = duration + wait_bye
-        if app.call_completed.wait(timeout=timeout):
+        if wait_call_end(app, timeout):
             print("Call completed (BYE from remote).", file=sys.stderr)
             return True
         else:

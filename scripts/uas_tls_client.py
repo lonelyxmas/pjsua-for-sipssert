@@ -24,35 +24,37 @@ SIP UAS + TLS Client with RTP/SRTP echo validation and header support.
     --tolerance 90
 """
 
+import argparse
+import contextlib
 import sys
 import threading
 import time
 
+import pjsua2 as pj  # type: ignore[import-unresolved]  # существует только внутри образа (apk py3-pjsua)
+
 sys.path.insert(0, "/scripts")
 
 from common import (
-    add_common_args,
     _apply_arg_defaults,
-    init_endpoint,
+    add_common_args,
+    apply_bye_default,
+    ConfigLoader,
     configure_srtp,
     create_transport,
-    safe_shutdown,
-    safe_exit,
-    print_echo_results,
-    print_options_results,
     EchoValidatorPort,
     HeaderManager,
-    ConfigLoader,
+    init_endpoint,
     OptionsPingManager,
-    apply_bye_default,
+    print_echo_results,
+    print_options_results,
+    reconnect_media,
+    safe_exit,
+    safe_shutdown,
     schedule_bye,
     schedule_reinvites,
-    reconnect_media,
+    wait_call_end,
     wait_for_completion,
 )
-
-import argparse
-import pjsua2 as pj
 
 
 # ---------------------------------------------------------------------------
@@ -64,13 +66,13 @@ class App:
         self.args = args
         self.header_mgr = header_mgr
         self.ep = None
-        self.account = None
+        self.account: UasAccount | None = None
         self.transport_id = None
-        self.validator = None
+        self.validator: EchoValidatorPort | None = None
         self.header_results = []
         self.call_completed = threading.Event()
         self.call_success = False
-        self.options_mgr = None
+        self.options_mgr: OptionsPingManager | None = None
         self.reinvite_timers = []
         self.active_call = None
 
@@ -139,14 +141,12 @@ class UasCall(pj.Call):
         """Track OPTIONS responses for OptionsPingManager."""
         if not self.app.options_mgr:
             return
-        try:
+        with contextlib.suppress(Exception):
             whole_msg = prm.e.body.tsxState.src.rdata.wholeMsg
             if whole_msg.startswith("SIP/2.0 2"):
                 tsx = prm.e.body.tsxState.tsx
                 if tsx.method == "OPTIONS":
                     self.app.options_mgr.on_options_response(tsx.statusCode)
-        except Exception:
-            pass
 
     def onCallMediaState(self, prm):
         ci = self.getInfo()
@@ -198,10 +198,8 @@ def main():
         if ":" in proxy:
             host, port_str = proxy.rsplit(":", 1)
             args.remote_host = host.strip()
-            try:
+            with contextlib.suppress(ValueError):
                 args.remote_port = int(port_str.strip())
-            except ValueError:
-                pass
         else:
             args.remote_host = proxy.strip()
 
@@ -216,6 +214,7 @@ def main():
     apply_bye_default(args, "uas")
 
     rc = 1
+    fast_exit = False
     try:
         # Init endpoint
         ep = init_endpoint(args)
@@ -269,7 +268,7 @@ def main():
         print(f"Waiting for incoming call (timeout: {wait_timeout}s)...",
               file=sys.stderr)
 
-        got_call = app.call_completed.wait(timeout=wait_timeout)
+        got_call = wait_call_end(app, wait_timeout)
 
         if not got_call and app.active_call is None:
             print("Timeout: no incoming call received.", file=sys.stderr)
@@ -294,12 +293,16 @@ def main():
             app.options_mgr, getattr(args, "options_tolerance", 90.0))
 
         rc = 0 if (echo_passed and header_passed and options_passed and got_call) else 1
+        # fast-path: wait_call_end сам увидел DISCONNECTED — hangupAll не нужен,
+        # экономим сотни мс в гонке с teardown sipssert (см. common.safe_shutdown)
+        fast_exit = getattr(app, "call_already_disconnected", False)
 
     except Exception as e:
         print(f"FATAL: {e}", file=sys.stderr)
         rc = 1
     finally:
-        safe_shutdown(app.ep, validator=app.validator, account=app.account)
+        safe_shutdown(app.ep, validator=app.validator, account=app.account,
+                      hangup=not fast_exit)
 
     safe_exit(rc)
 

@@ -41,6 +41,7 @@ from common import (
     schedule_reinvites,
     reconnect_media,
     wait_for_completion,
+    wait_call_end,
 )
 
 
@@ -215,7 +216,7 @@ def main():
     print(f"Waiting for incoming call (timeout: {wait_timeout}s)...",
           file=sys.stderr)
 
-    got_call = app.call_completed.wait(timeout=wait_timeout)
+    got_call = wait_call_end(app, wait_timeout)
 
     if not got_call and app.active_call is None:
         print("Timeout: no incoming call received.", file=sys.stderr)
@@ -242,7 +243,11 @@ def main():
 
     rc = 0 if (echo_passed and header_passed and options_passed and got_call) else 1
 
-    safe_shutdown(ep, validator=app.validator, account=app.account)
+    # fast-path: wait_call_end сам увидел DISCONNECTED — hangupAll не нужен,
+    # активных вызовов нет; экономим сотни мс в гонке с teardown sipssert
+    fast_exit = getattr(app, "call_already_disconnected", False)
+    safe_shutdown(ep, validator=app.validator, account=app.account,
+                  hangup=not fast_exit)
     safe_exit(rc)
 
 

@@ -1,3 +1,10 @@
+---
+# ⚠️ ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ pjsua2: сценарий ВСЕГДА падает на проверке OPTIONS.
+# pjsua/pjsua2 не умеет отвечать на in-dialog OPTIONS: call usage отклоняет
+# запрос («Unhandled by dialog usages» → 500) до любого app-кода, а в pjsua2
+# нет ни колбэка для входящих in-dialog запросов, ни API ответа на них
+# (проверено на 2.14.1/2.17/master; флаг --options-auto-reply неосуществим).
+# OPTIONS-keepalive от реальных АТС — out-of-dialog, там pjsua отвечает 200.
 tasks:
   # UAS: listens, answers, auto-replies to OPTIONS
   - name: pjsua-uas
@@ -19,7 +26,7 @@ tasks:
   - name: pjsua-uac
     image: pjsua-test
     require:
-      - { started: pjsua-uas }
+      - {started: pjsua-uas}
     args:
       - "--mode=uac"
       - "--proxy=127.0.0.1:15085"

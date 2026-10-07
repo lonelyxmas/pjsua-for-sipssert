@@ -15,7 +15,7 @@ Docker-образ на базе PJSIP для тестирования SIP over T
 ## Структура
 
 ```
-Dockerfile              — Alpine 3.20 + пакеты pjproject 2.14.1 + py3-yaml
+Dockerfile              — Alpine 3.24 + пакеты pjproject 2.17 + py3-yaml
 entrypoint.sh           — CLI-обёртка (режимы uac, uas, uas-tls-client, uac-tls-server)
 scripts/
   common.py             — общий модуль: EchoValidatorPort, OptionsPingManager, HeaderManager,
@@ -38,7 +38,15 @@ tests/                  — sipssert интеграционные тесты (14
   pjsua-bye-none/       — без BYE
   pjsua-reinvite-uac/   — re-INVITE от UAC
   pjsua-reinvite-uas/   — re-INVITE от UAS
-  pjsua-options-ping/   — in-dialog OPTIONS ping
+  pjsua-options-ping/   — in-dialog OPTIONS ping (⚠ всегда FAIL — ограничение pjsua2, см. Known Issues README)
+```
+
+Юнит-тесты (46 тестов, pure-python — запускаются ВНУТРИ контейнера, вне его
+нужен мок pjsua2):
+
+```bash
+docker run --rm --entrypoint python3 -v "$PWD/tests:/tests:ro" pjsua-test:new \
+    -m unittest discover -s /tests -p "test_common.py"
 ```
 
 ## Ключевые решения
@@ -50,11 +58,26 @@ tests/                  — sipssert интеграционные тесты (14
 - **EchoValidatorPort** — кастомный `AudioMediaPort` для побайтового сравнения RTP/SRTP фреймов
 - **--bye=uac|uas|none** — контроль стороны отправки BYE; `--wait-bye` задаёт таймаут ожидания BYE от удалённой стороны
 - **--reinvite-by / --reinvite-delay** — отправка re-INVITE через заданные задержки; onCallMediaState переподключает EchoValidatorPort
-- **--options-ping / --options-auto-reply / --options-tolerance** — in-dialog OPTIONS keepalive с валидацией ответов; OptionsPingManager в common.py
+- **--options-ping / --options-auto-reply / --options-tolerance** — in-dialog OPTIONS keepalive с валидацией ответов; OptionsPingManager в common.py.
+  ⚠️ Ответная сторона (options-auto-reply) НЕ реализуема на pjsua2: входящий
+  in-dialog OPTIONS отклоняется библиотекой (500 «Unhandled by dialog usages»,
+  sip_dialog.c) до app-кода — колбэка/API для ответа в pjsua2 нет (проверено
+  на 2.14.1/2.17/master). Сценарий pjsua-options-ping всегда FAIL.
+  Keepalive из реальных АТС — out-of-dialog, pjsua отвечает штатно.
 - **--transport** — параметр для выбора транспорта (tls, tcp, udp, default: tls); uac/uas поддерживают все 3; режимы с TLS-ролями всегда используют TLS. В TRANSPORT_MAP (entrypoint.sh) отображаются значения на порты и флаги.
 - **Probe INVITE** — uas-tls-client отправляет probe для сигнализации о TLS-готовности uac-tls-server
 - **transportId** — аккаунты привязаны к конкретным TLS-транспортам для корректной маршрутизации
 - **os._exit()** — обход segfault в PJSUA2 Python bindings при libDestroy()
+- **Быстрый shutdown + SIGTERM-handler** (совместимость с pjproject 2.17 / alpine 3.24):
+  на 2.17 libDestroy занимает ~1.5s и onCallState(DISCONNECTED) у uas приходит
+  с задержкой ~2s после BYE (на 2.14 — мгновенно); sipssert же делает
+  daemon-контейнерам docker stop(timeout=0) сразу после выхода клиента →
+  uas получал SIGKILL (137) и сценарии падали на teardown. Контрмеры:
+  wait_call_end() опрашивает состояние вызова в дополнение к событию,
+  safe_shutdown() пропускает hangupAll/destroy при уже завершённом вызове,
+  install_signal_exit() даёт чистый exit 0 по SIGTERM (важно для PID 1:
+  без обработчика ядро не доставляет SIGTERM вообще),
+  tests/config.yml задаёт stop_timeout: 5
 - Exit code `0`/`1` для совместимости с sipssert
 
 ## Интеграция с sipssert

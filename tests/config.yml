@@ -1,2 +1,15 @@
 defaults:
+  # network_mode: host оставлен для старых версий sipssert (на master это
+  # no-op: host и так дефолт при отсутствии network/networks)
   network_mode: host
+  generic:
+    # мягкий stop для daemon-задач: python в PID 1 контейнера без обработчика
+    # SIGTERM переживает docker stop (ядро не доставляет default-сигналы
+    # PID 1) и добивается SIGKILL → exit 137 → сценарий FAIL. В образе стоит
+    # обработчик SIGTERM (scripts/common.py install_signal_exit), поэтому
+    # stop(t=5) даёт чистый exit 0. Ключ читается из ОПРЕДЕЛЕНИЯ задачи
+    # (task.py: config.get("stop_timeout")), поэтому кладём его в
+    # defaults по типу задачи "generic" (tasks_list.py мержит defaults[type])
+    # (ревью 2026-10-06: uas на pjproject 2.17 не успевал сам выйти до
+    # stop(timeout=0) — 12/14 сценариев падали на teardown)
+    stop_timeout: 5

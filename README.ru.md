@@ -23,7 +23,7 @@ SIPp (v3.7) имеет ряд проблем, которые не решаютс
 docker build -t pjsua-test .
 ```
 
-Образ основан на Alpine 3.20 с готовыми пакетами `pjproject` 2.14.1 и `py3-yaml` — сборка занимает ~5 секунд.
+Образ основан на Alpine 3.24 с готовыми пакетами `pjproject` 2.17 и `py3-yaml` — сборка занимает ~5 секунд.
 
 ## Режимы работы
 
@@ -635,7 +635,7 @@ EchoValidatorPort → conference bridge → G.711 encode → RTP → сеть �
 
 ```
 .
-├── Dockerfile              # Alpine 3.20 + pjproject/pjsua/py3-pjsua/py3-yaml пакеты
+├── Dockerfile              # Alpine 3.24 + pjproject/pjsua/py3-pjsua/py3-yaml пакеты
 ├── entrypoint.sh           # CLI-обёртка: разбирает аргументы, запускает нужный скрипт
 ├── scripts/
 │   ├── common.py           # Общий модуль: EchoValidatorPort, OptionsPingManager,
@@ -669,6 +669,33 @@ EchoValidatorPort → conference bridge → G.711 encode → RTP → сеть �
   При использовании старого кэша Docker могут проявиться — пересоберите с `--no-cache`.
 - **Segfault при выходе**: PJSUA2 Python bindings иногда крашатся при `libDestroy()`.
   Обходится через `os._exit()` — exit code корректен.
+- **Teardown на pjproject 2.17 (alpine ≥3.24)**: `libDestroy()` занимает ~1.5s,
+  а колбэк `onCallState(DISCONNECTED)` на uas-стороне приходит через ~2s после
+  BYE (на 2.14 — мгновенно). Поскольку sipssert делает daemon-контейнерам
+  `docker stop(timeout=0)` сразу после завершения клиента, завершение должно
+  быть быстрым: `wait_call_end()` опрашивает состояние вызова в дополнение к
+  событию, `safe_shutdown()` пропускает `hangupAll()`/destroy для уже
+  завершённого вызова, а обработчик SIGTERM (`install_signal_exit()`)
+  превращает `docker stop` в чистый exit 0 — учтите, что PID 1 вообще не
+  получает сигналы с default-диспозицией, без обработчика контейнер всегда
+  умирает с 137. Задайте `stop_timeout: 5` в `defaults: generic:` конфига
+  sipssert, чтобы `docker stop` сначала отправлял SIGTERM. Два нюанса:
+  (1) нужен sipssert с мерджем defaults по типу задачи (`tasks_list.py`) —
+  на старых версиях добавьте `stop_timeout: 5` в каждую daemon-задачу
+  `scenario.yml`; (2) SIGINT (Ctrl+C) тоже превращается в тихий exit 0 —
+  без KeyboardInterrupt traceback при ручном запуске скриптов.
+- **Горизонт валидности тестовых сертов**: каталоги `certs/` 9 исходных
+  сценариев истекают **2027-04-02**; 5 перегенерированных (bye-from-uas,
+  bye-none, options-ping, reinvite-uac, reinvite-uas) — **2036**. Примерно с
+  апреля 2027 suite начнёт падать на сертификатных ошибках — перегенерируйте
+  единообразно при коммите или заранее.
+- **In-dialog OPTIONS keepalive (сценарий `pjsua-options-ping`) всегда падает**:
+  pjsua2 не умеет отвечать на in-dialog OPTIONS — диалог отклоняет запрос с
+  `500 Unhandled by dialog usages` (sip_dialog.c) до любого app-кода, а в
+  pjsua2 нет ни колбэка для входящих in-dialog запросов, ни API ответа на них
+  (проверено на 2.14.1, 2.17 и master). Флаг `--options-auto-reply`
+  неосуществим; keepalive из реальных АТС — out-of-dialog, pjsua отвечает
+  штатно с 200.
 - **Probe INVITE** (режим `uac-tls-server`): uas-tls-client отправляет probe INVITE
   для сигнализации о готовности TLS-соединения. uac-tls-server отклоняет его (486 Busy)
   и затем отправляет настоящий INVITE.
