@@ -36,6 +36,7 @@ import pjsua2 as pj  # type: ignore[import-unresolved]  # существует �
 sys.path.insert(0, "/scripts")
 
 from common import (
+    on_rx_reinvite,
     _apply_arg_defaults,
     add_common_args,
     apply_bye_default,
@@ -161,6 +162,10 @@ class UasCall(pj.Call):
                 reconnect_media(self, self.app, mi_idx)
             except Exception as e:
                 print(f"Media setup error: {e}", file=sys.stderr)
+
+    def onCallRxReinvite(self, prm):
+        """Reject SRTP-incompatible re-INVITE offers without breaking media."""
+        on_rx_reinvite(self.app, prm, self)
 
 
 # ---------------------------------------------------------------------------

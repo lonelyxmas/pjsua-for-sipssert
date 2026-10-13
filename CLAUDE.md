@@ -78,6 +78,15 @@ docker run --rm --entrypoint python3 -v "$PWD/tests:/tests:ro" pjsua-test:new \
   install_signal_exit() даёт чистый exit 0 по SIGTERM (важно для PID 1:
   без обработчика ядро не доставляет SIGTERM вообще),
   tests/config.yml задаёт stop_timeout: 5
+- **Фазово-независимый эхо-паттерн + ре-анкор re-INVITE** (валидация RTP/SRTP):
+  паттерн `EchoValidatorPort` — короткий цикл (26 значений, оба знака) полностью
+  покрытый ring buffer 64; иначе одностороннее окно фазы выпадало при
+  пересоздании медиа-сессии на re-INVITE и все кадры после него считались
+  mismatch. Входящий re-INVITE без `a=crypto` (кейс rtpengine-passthrough)
+  отклоняется с 488 ДО media re-init (pjproject 2.17 при неудавшейся
+  ренеготиации подменяет активный SRTP RX-ключ → входящий аудио умирает в
+  тишину), затем через 0.2с отправляется свой re-INVITE для ре-анкора медиа-ноги
+  (RFC 3261 §14.2); окно матча имеет запас +2% сверху под requantизацию G.711
 - Exit code `0`/`1` для совместимости с sipssert
 
 ## Интеграция с sipssert

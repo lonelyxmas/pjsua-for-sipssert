@@ -109,20 +109,48 @@ def _build_stable_values():
     return values
 
 
-# Use mid-range amplitudes: large enough to be distinguishable after conference
-# bridge attenuation, small enough to avoid clipping.  Exclude 0 (silence).
-# Sorted by absolute value; we pick values in the 500..20000 range for best
-# survival through G.711 + conference bridge pipeline.
-_STABLE_VALUES = [
-    v for v in sorted(_build_stable_values(), key=abs)
-    if 500 <= abs(v) <= 20000
-]
+# Use a SHORT cycle of well-separated amplitudes instead of every distinct
+# μ-law-stable value: the sent-ring (EchoValidatorPort.RING_SIZE = 64) must
+# cover the whole pattern cycle.  Then echo matching is immune to constant
+# phase shifts between the two peers — which mid-call re-INVITE produces
+# (media session recreation perturbs the relative frame counters), and
+# which previously flipped the one-sided ring window and failed every frame
+# until the end of the call.  Well-separated magnitudes keep corruption
+# detection: silence, garbage amplitude or extreme attenuation still fall
+# outside all bins (same sign + |v|/12 ≤ |median| ≤ |v| window).
+def _select_pattern_values(low=500, high=20000, growth=1.35, min_ratio=1.25):
+    """Pick a short cycle of μ-law-stable values (len*2 ≤ ring size).
+
+    Magnitudes are log-spaced across [low, high] and snapped to the
+    nearest μ-law fixed point; consecutive magnitudes keep at least
+    min_ratio separation so bins stay distinguishable under conference
+    bridge attenuation.  Every magnitude is present with BOTH signs
+    (signs alternate frame-to-frame), so a codec round-trip that
+    amplifies a frame slightly (a-law/μ-law requantisation shifts the
+    largest bins by ~1%) still matches the next same-sign bin up.
+    """
+    stable_mags = sorted({abs(v) for v in _build_stable_values()
+                          if low <= abs(v) <= high})
+    mags = []
+    target = float(low)
+    while target <= high:
+        best = min(stable_mags, key=lambda a: abs(a - target))
+        if not mags or best >= mags[-1] * min_ratio:
+            mags.append(best)
+        target *= growth
+    cycle = mags + list(reversed(mags))
+    return [m if i % 2 == 0 else -m for i, m in enumerate(cycle)]
+
+
+_STABLE_VALUES = _select_pattern_values()
 
 
 class EchoValidatorPort(pj.AudioMediaPort):
     """
-    Generates deterministic audio frames (4-byte LE counter pattern,
-    pre-quantized through μ-law to survive G.711 encode/decode).
+    Generates deterministic audio frames cycling through a short sequence
+    of well-separated μ-law-stable values (cycle fits into the sent-ring,
+    see _select_pattern_values — keeps matching immune to peer phase
+    shifts after mid-call re-INVITE).
     Captures echoed frames and compares against ring buffer of last 64 sent frames.
     """
 
@@ -205,6 +233,7 @@ class EchoValidatorPort(pj.AudioMediaPort):
 
             if abs(median) < self.SILENCE_THRESHOLD:
                 self.frames_mismatched += 1
+                self._debug_rx(median, "silence")
                 return
 
             matched = False
@@ -215,9 +244,11 @@ class EchoValidatorPort(pj.AudioMediaPort):
                 # Same sign?
                 if (sent_val > 0) != (median > 0):
                     continue
-                # Proportional match: allow 3-12× attenuation
+                # Proportional match: allow 3-12× attenuation downwards
+                # and ~2% headroom upwards (G.711 a-law/μ-law round-trip
+                # requantisation can amplify the largest bins by ~1%).
                 av = abs(sent_val)
-                if av // 12 <= am <= av:
+                if av // 12 <= am <= av + av // 50:
                     matched = True
                     break
 
@@ -225,6 +256,24 @@ class EchoValidatorPort(pj.AudioMediaPort):
                 self.frames_matched += 1
             else:
                 self.frames_mismatched += 1
+            self._debug_rx(median, "ok" if matched else "mismatch")
+
+    # Field diagnostics, disabled by default (PJSUA_ECHO_DEBUG=1 enables).
+    _debug_enabled = os.environ.get("PJSUA_ECHO_DEBUG") == "1"
+    _debug_count = 0
+
+    def _debug_rx(self, median, verdict):
+        """Per-frame RX trace for field diagnostics (PJSUA_ECHO_DEBUG=1).
+
+        Prints the first 400 received frames: running rx index, median and
+        verdict — enough to see attenuation and phase behaviour around a
+        re-INVITE without flooding the log on long calls.
+        """
+        if not self._debug_enabled or self._debug_count >= 400:
+            return
+        self._debug_count += 1
+        print(f"ECHO-DBG rx={self.frames_received} seq={self.seq} "
+              f"median={median} verdict={verdict}", file=sys.stderr)
 
     def get_stats(self):
         """Return dict with sent/received/matched/mismatched/match_pct."""
@@ -1220,6 +1269,58 @@ def wait_for_completion(app, role: str):
 # ---------------------------------------------------------------------------
 # re-INVITE helpers
 # ---------------------------------------------------------------------------
+
+def on_rx_reinvite(app, prm, call=None):
+    """Guard hook for Call.onCallRxReinvite.
+
+    pjsua 2.17 with SRTP enabled fails media re-initialisation when the
+    incoming re-INVITE offer carries no a=crypto (e.g. a re-INVITE passed
+    through rtpengine without SRTP flags): it answers 488, but has already
+    swapped the ACTIVE SRTP RX key to the never-used provisional one. Every
+    subsequent inbound packet then fails SRTP authentication and the media
+    stream degrades to silence for the rest of the call.
+
+    Reject the offer (488) BEFORE pjsua touches media state: per RFC 3261
+    §14.2 the previous session parameters remain in effect. Offers that do
+    carry crypto are left to the normal renegotiation path (statusCode
+    untouched).
+
+    Additionally, a crypto-less re-offer through an SBC/rtpengine in codec
+    passthrough mode may itself re-key the media leg before the 488 arrives
+    (the offer processing disturbs the leg state regardless of the answer),
+    so the inbound audio can stay broken even after a clean rejection.
+    To restore it, schedule a re-anchor re-INVITE of our own (*call*):
+    a fresh, fully-crypto offer re-synchronises the media leg and audio
+    resumes on the same SRTP session.
+    """
+    srtp = str(getattr(app.args, "srtp", "") or "off")
+    if srtp not in ("mandatory", "optional"):
+        return
+    try:
+        whole_msg = prm.rdata.wholeMsg or ""
+    except Exception:
+        whole_msg = ""
+    if "a=crypto" in whole_msg:
+        return
+    prm.statusCode = 488
+    print("Re-INVITE offer without SRTP crypto — rejecting with 488, "
+          "keeping current media session.", file=sys.stderr)
+    if call is None:
+        return
+
+    def _reanchor():
+        """Re-anchor the media session with our own crypto re-INVITE."""
+        try:
+            reinvite_prm = pj.CallOpParam(True)
+            call.reinvite(reinvite_prm)
+            print("Re-anchor re-INVITE sent.", file=sys.stderr)
+        except Exception as e:
+            print(f"Re-anchor re-INVITE error: {e}", file=sys.stderr)
+
+    timer = threading.Timer(0.2, _reanchor)
+    timer.daemon = True
+    timer.start()
+
 
 def schedule_reinvites(call, app, role: str):
     """

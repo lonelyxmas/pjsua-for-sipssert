@@ -437,12 +437,16 @@ tasks:
 When used with `rtp_echo` on the remote side, pjsua-test performs byte-by-byte
 media stream verification:
 
-1. `EchoValidatorPort` generates frames with a deterministic pattern (4-byte counter)
+1. `EchoValidatorPort` generates frames cycling through a short sequence of
+   well-separated μ-law-stable values (the cycle fits into the 64-value ring
+   buffer, which keeps matching immune to peer phase shifts after mid-call
+   re-INVITE — see below)
 2. PJSIP encrypts the frame (SRTP) and sends it over the network
 3. The remote side (`rtp_echo`) returns the encrypted packet as-is
 4. PJSIP decrypts the received packet with its own key
 5. `EchoValidatorPort` compares the decrypted payload against a ring buffer of sent frames
-6. Echo delay is accounted for: search among the last 64 sent frames
+6. Echo delay is accounted for: the ring holds the last 64 sent values,
+   covering several full pattern cycles
 
 Result:
 
@@ -541,7 +545,23 @@ The μ-law-stable values survive G.711 PCMU encode/decode without loss. However,
 
 1. Compute the **median** of all samples in the received frame
 2. If `|median| < 10` — frame is treated as silence (mismatch)
-3. Search the ring buffer (last 64 sent values) for a match: same **sign** and amplitude within proportional range (`|sent| / 12 ≤ |median| ≤ |sent|`)
+3. Search the ring buffer (last 64 sent values) for a match: same **sign** and amplitude within proportional range (`|sent| / 12 ≤ |median| ≤ |sent| · 1.02` — the 2% upper headroom absorbs G.711 requantisation)
+
+**Why a short pattern cycle:** a mid-call re-INVITE recreates the media
+session and perturbs the relative frame counters of the two peers. With a
+160-value pattern cycle the one-sided 64-value ring window flipped out of
+range on any such perturbation and every subsequent frame was counted as a
+mismatch. With the cycle fully covered by the ring, matching is immune to
+constant phase offsets while still detecting silence, amplitude garbage and
+codec corruption.
+
+**Incoming re-INVITE under SRTP:** a re-INVITE offer without `a=crypto`
+(e.g. relayed by an SBC/rtpengine without SRTP flags) is rejected with 488
+before pjsua touches media state (RFC 3261 §14.2 — the previous session
+stays in effect), and a re-anchor re-INVITE is sent 0.2 s later to
+re-synchronise the media leg. Without this, pjproject 2.17 swaps the active
+SRTP RX key on the failed renegotiation and inbound audio degrades to
+silence for the rest of the call.
 
 **Codec compatibility:**
 

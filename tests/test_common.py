@@ -333,10 +333,40 @@ class TestStableValues(unittest.TestCase):
         self.assertEqual(len(_STABLE_VALUES), len(set(_STABLE_VALUES)))
 
     def test_has_positive_and_negative(self):
+        """Both signs must be present: matching requires a same-sign bin
+        for any received median, and signs alternate frame-to-frame."""
         pos = [v for v in _STABLE_VALUES if v > 0]
         neg = [v for v in _STABLE_VALUES if v < 0]
-        self.assertTrue(len(pos) > 10)
-        self.assertTrue(len(neg) > 10)
+        self.assertGreaterEqual(len(pos), 5)
+        self.assertGreaterEqual(len(neg), 5)
+
+    def test_pattern_cycle_fits_ring_buffer(self):
+        """Pattern cycle must fit entirely into the sent-ring window.
+
+        Mid-call re-INVITE recreates the media session and shifts the
+        relative frame counters of the two peers. If the ring (last 64
+        sent values) covers the whole cycle, echo matching is immune to
+        any constant phase offset between the peers. Otherwise a peer
+        whose counter falls outside the one-sided window mismatches every
+        frame until the end of the call.
+        """
+        # EchoValidatorPort.RING_SIZE без импорта pjsua2:
+        # класс недоступен вне контейнера, значение фиксируем контрактом
+        ring_size = 64
+        self.assertLessEqual(
+            len(_STABLE_VALUES), ring_size,
+            f"pattern cycle ({len(_STABLE_VALUES)}) must fit "
+            f"into the sent-ring window ({ring_size})")
+
+    def test_pattern_magnitudes_well_separated(self):
+        """Consecutive magnitudes must differ enough to distinguish bins
+        under conference-bridge attenuation (matching window [v/12, v]).
+        Each magnitude appears twice (both signs) — dedupe first."""
+        mags = sorted({abs(v) for v in _STABLE_VALUES})
+        for prev, cur in zip(mags, mags[1:]):
+            self.assertGreaterEqual(
+                cur / prev, 1.3,
+                f"magnitudes {prev} and {cur} are too close")
 
 
 # -----------------------------------------------------------------------
@@ -416,6 +446,185 @@ class TestEchoValidatorPort(unittest.TestCase):
         f = self._make_frame(size=0)
         v.onFrameRequested(f)
         self.assertEqual(f.size, 320)
+
+    @staticmethod
+    def _received_frame(value):
+        """Build a received frame filled with a single constant value."""
+        f = TestEchoValidatorPort._make_frame_raw()
+        samples = [value] * 160
+        f.size = 320
+        f.buf = pj.ByteVector(struct.pack("<160h", *samples))
+        f.type = pj.PJMEDIA_FRAME_TYPE_AUDIO
+        return f
+
+    @staticmethod
+    def _make_frame_raw(size=320):
+        class FakeFrame:
+            pass
+        f = FakeFrame()
+        f.size = size
+        f.buf = None
+        f.type = 0
+        return f
+
+    def _reset_validator(self, v):
+        """Reset pattern/counters state between test cases (one port)."""
+        with v.lock:
+            v.seq = 0
+            v.sent_ring.clear()
+            v.frames_sent = 0
+            v.frames_received = 0
+            v.frames_matched = 0
+            v.frames_mismatched = 0
+
+    def test_echo_match_immune_to_phase_shift(self):
+        """Echo with arbitrary frame-phase offset must fully match.
+
+        Regression test for mid-call re-INVITE: media session recreation
+        perturbs relative frame counters, so the peer's stream may be an
+        arbitrary number of frames ahead or behind. The ring window must
+        cover the whole pattern cycle so any constant offset matches.
+        """
+        from common import EchoValidatorPort
+        v = EchoValidatorPort()
+        v.register("phase-test")
+
+        n_send = 100   # fill the ring beyond RING_SIZE
+        n_check = 40
+        # offsets: in-window (control group), edge, and all the
+        # out-of-window shifts that a re-INVITE transition can produce
+        # (peer ahead or behind); relative to the last sent frame
+        offsets = (0, 1, 5, 63, 64, 96, 159, -1, -5, -63, -64, -96, -159)
+        cycle = len(_STABLE_VALUES)
+        for offset in offsets:
+            self._reset_validator(v)
+            for _ in range(n_send):
+                v.onFrameRequested(self._make_frame())
+            for _ in range(n_check):
+                with v.lock:
+                    last_sent_seq = v.seq - 1
+                peer_val = _STABLE_VALUES[(last_sent_seq + offset) % cycle]
+                v.onFrameReceived(self._received_frame(peer_val))
+            stats = v.get_stats()
+            self.assertEqual(
+                stats["mismatched"], 0,
+                f"offset={offset}: {stats['mismatched']} frames mismatched")
+            self.assertEqual(
+                stats["matched"], n_check,
+                f"offset={offset}: only {stats['matched']}/{n_check} matched")
+
+    def test_corrupted_echo_frames_detected(self):
+        """Negative test: validator MUST catch corrupted echo payloads.
+
+        The phase-robustness fix must not turn the validator into a
+        no-op: silence, garbage amplitude and near-silence noise are
+        still counted as mismatches.
+        """
+        from common import EchoValidatorPort
+        v = EchoValidatorPort()
+        v.register("corrupt-test")
+
+        for _ in range(80):
+            v.onFrameRequested(self._make_frame())
+        # healthy echo (peer mirrors the last frame we sent)
+        for _ in range(10):
+            with v.lock:
+                last_sent_seq = v.seq - 1
+            peer_val = _STABLE_VALUES[last_sent_seq % len(_STABLE_VALUES)]
+            v.onFrameReceived(self._received_frame(peer_val))
+        # corrupted payloads: each must be caught
+        corruptions = (0, 30000, -30000, 20)  # silence, +/- clip, noise
+        for value in corruptions:
+            v.onFrameReceived(self._received_frame(value))
+
+        stats = v.get_stats()
+        self.assertEqual(stats["matched"], 10, str(stats))
+        self.assertEqual(stats["mismatched"], len(corruptions), str(stats))
+
+    def test_echo_tolerates_codec_roundtrip_amplification(self):
+        """G.711 a-law/μ-law round-trip can amplify values by ~1%.
+
+        The largest bins must still match: the same-sign bin window is
+        [v/12, v+2%], so a +1% requantisation shift does not fall out.
+        """
+        from common import EchoValidatorPort
+        v = EchoValidatorPort()
+        v.register("codec-headroom-test")
+
+        for _ in range(80):
+            v.onFrameRequested(self._make_frame())
+        # every bin, shifted up by ~1% (worst-case codec amplification)
+        for bin_val in _STABLE_VALUES:
+            shifted = int(round(bin_val * 1.01)) or 1
+            v.onFrameReceived(self._received_frame(shifted))
+        stats = v.get_stats()
+        self.assertEqual(stats["mismatched"], 0, str(stats))
+        self.assertEqual(stats["matched"], len(_STABLE_VALUES), str(stats))
+
+
+class _FakeRdata:
+    def __init__(self, whole_msg):
+        self.wholeMsg = whole_msg
+
+
+class _FakePrm:
+    def __init__(self, whole_msg):
+        self.rdata = _FakeRdata(whole_msg)
+        self.statusCode = 200
+
+
+class _FakeApp:
+    def __init__(self, srtp):
+        self.args = argparse.Namespace(srtp=srtp)
+
+
+class TestOnRxReinvite(unittest.TestCase):
+    """on_rx_reinvite: reject crypto-less re-INVITE offers under SRTP.
+
+    pjsua 2.17 swaps the active SRTP RX key even when the re-INVITE is
+    answered 488, which kills inbound audio for the rest of the call.
+    Rejecting BEFORE media re-init keeps the current session (RFC 3261
+    §14.2).
+    """
+
+    OFFER_WITHOUT_CRYPTO = (
+        "INVITE sip:x SIP/2.0\r\n\r\n"
+        "v=0\r\no=- 1 2 IN IP4 10.0.0.1\r\n"
+        "m=audio 10000 RTP/AVP 8 101\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+    )
+
+    OFFER_WITH_CRYPTO = (
+        "INVITE sip:x SIP/2.0\r\n\r\n"
+        "v=0\r\no=- 1 2 IN IP4 10.0.0.1\r\n"
+        "m=audio 10000 RTP/AVP 8 101\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:abcd\r\n"
+    )
+
+    def test_rejects_crypto_less_offer_when_srtp_mandatory(self):
+        from common import on_rx_reinvite
+        prm = _FakePrm(self.OFFER_WITHOUT_CRYPTO)
+        on_rx_reinvite(_FakeApp("mandatory"), prm)
+        self.assertEqual(prm.statusCode, 488)
+
+    def test_rejects_crypto_less_offer_when_srtp_optional(self):
+        from common import on_rx_reinvite
+        prm = _FakePrm(self.OFFER_WITHOUT_CRYPTO)
+        on_rx_reinvite(_FakeApp("optional"), prm)
+        self.assertEqual(prm.statusCode, 488)
+
+    def test_accepts_offer_with_crypto(self):
+        from common import on_rx_reinvite
+        prm = _FakePrm(self.OFFER_WITH_CRYPTO)
+        on_rx_reinvite(_FakeApp("mandatory"), prm)
+        self.assertEqual(prm.statusCode, 200)
+
+    def test_ignores_reinvite_when_srtp_off(self):
+        from common import on_rx_reinvite
+        prm = _FakePrm(self.OFFER_WITHOUT_CRYPTO)
+        on_rx_reinvite(_FakeApp("off"), prm)
+        self.assertEqual(prm.statusCode, 200)
 
 
 if __name__ == "__main__":
