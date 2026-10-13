@@ -698,3 +698,14 @@ All header checks are applied to the INVITE response (200 OK). A failed check re
 - **Probe INVITE** (`uac-tls-server` mode): uas-tls-client sends a probe INVITE
   to signal TLS connection readiness. uac-tls-server rejects it (486 Busy)
   and then sends the real INVITE.
+
+## License
+
+This project is licensed under the GNU General Public License v2.0
+or any later version (SPDX: `GPL-2.0-or-later`) — see the [LICENSE](LICENSE) file.
+
+The Docker image also contains third-party software under its own licenses,
+notably [pjproject / pjsua / py3-pjsua](https://github.com/pjsip/pjproject)
+(GPL-2.0-or-later, © Teluu Inc.) installed from Alpine packages, and the
+[Alpine Linux](https://alpinelinux.org/) base image and its packages under
+their respective licenses.

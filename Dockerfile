@@ -17,6 +17,7 @@ ENV JACK_NO_START_SERVER=1
 
 COPY entrypoint.sh /entrypoint.sh
 COPY scripts/ /scripts/
+COPY LICENSE /LICENSE
 RUN chmod +x /entrypoint.sh
 
 # sipssert mounts scenario dir to /home

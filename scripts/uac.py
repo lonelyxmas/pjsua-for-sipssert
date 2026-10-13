@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-or-later
 """
 uac.py — Standard SIP UAC (TLS client) with RTP/SRTP echo validation and header support.
 

@@ -699,3 +699,13 @@ EchoValidatorPort → conference bridge → G.711 encode → RTP → сеть �
 - **Probe INVITE** (режим `uac-tls-server`): uas-tls-client отправляет probe INVITE
   для сигнализации о готовности TLS-соединения. uac-tls-server отклоняет его (486 Busy)
   и затем отправляет настоящий INVITE.
+
+## Лицензия
+
+Проект распространяется под GNU General Public License v2.0 или более поздней
+версией (SPDX: `GPL-2.0-or-later`) — см. файл [LICENSE](LICENSE).
+
+Docker-образ также содержит стороннее ПО под собственными лицензиями:
+[pjproject / pjsua / py3-pjsua](https://github.com/pjsip/pjproject)
+(GPL-2.0-or-later, © Teluu Inc.) из пакетов Alpine, а также базовый образ
+[Alpine Linux](https://alpinelinux.org/) и его пакеты под их лицензиями.
