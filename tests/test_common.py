@@ -361,7 +361,12 @@ class TestStableValues(unittest.TestCase):
     def test_pattern_magnitudes_well_separated(self):
         """Consecutive magnitudes must differ enough to distinguish bins
         under conference-bridge attenuation (matching window [v/12, v]).
-        Each magnitude appears twice (both signs) — dedupe first."""
+        Each magnitude appears twice (both signs) — dedupe first.
+
+        Пинним достигнутое разделение (≥1.3) с запасом над min_ratio=1.25
+        из _select_pattern_values — при смене констант тест останется
+        сторожем чувствительности бинов.
+        """
         mags = sorted({abs(v) for v in _STABLE_VALUES})
         for prev, cur in zip(mags, mags[1:]):
             self.assertGreaterEqual(
@@ -541,6 +546,28 @@ class TestEchoValidatorPort(unittest.TestCase):
         self.assertEqual(stats["matched"], 10, str(stats))
         self.assertEqual(stats["mismatched"], len(corruptions), str(stats))
 
+    def test_non_audio_frame_not_counted(self):
+        """Acceptance criterion: added T.140 text media must not affect audio
+        validation — the audio validator ignores non-audio frame types
+        (e.g. PJMEDIA_FRAME_TYPE_NONE frames after text-stream negotiation)."""
+        from common import EchoValidatorPort
+        v = EchoValidatorPort()
+        v.register("text-media-test")
+
+        for _ in range(10):
+            v.onFrameRequested(self._make_frame())
+
+        f = self._make_frame_raw()
+        f.size = 320
+        f.buf = pj.ByteVector(struct.pack("<160h", *([500] * 160)))
+        f.type = pj.PJMEDIA_FRAME_TYPE_NONE  # не аудио
+        v.onFrameReceived(f)
+
+        stats = v.get_stats()
+        self.assertEqual(stats["received"], 0, str(stats))
+        self.assertEqual(stats["matched"], 0, str(stats))
+        self.assertEqual(stats["mismatched"], 0, str(stats))
+
     def test_echo_tolerates_codec_roundtrip_amplification(self):
         """G.711 a-law/μ-law round-trip can amplify values by ~1%.
 
@@ -602,21 +629,54 @@ class TestOnRxReinvite(unittest.TestCase):
         "a=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:abcd\r\n"
     )
 
+    # re-INVITE, добавляющий текстовую медиа (T.140/red) поверх SRTP-аудио —
+    # реальный кейс сценария 04 (оффер №2 от pbx, см. rtpengine-дамп)
+    OFFER_WITH_CRYPTO_AND_TEXT = (
+        "INVITE sip:x SIP/2.0\r\n\r\n"
+        "v=0\r\no=- 1 2 IN IP4 10.0.0.1\r\n"
+        "m=audio 10000 RTP/AVP 8 101\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
+        "a=crypto:1 AES_256_CM_HMAC_SHA1_80 inline:abcd\r\n"
+        "m=text 19266 RTP/AVP 100 98\r\n"
+        "a=rtpmap:100 red/1000\r\n"
+        "a=rtpmap:98 t140/1000\r\n"
+    )
+
+    OFFERLESS_REFRESH = "INVITE sip:x SIP/2.0\r\nVia: a\r\n\r\n"
+
     def test_rejects_crypto_less_offer_when_srtp_mandatory(self):
         from common import on_rx_reinvite
         prm = _FakePrm(self.OFFER_WITHOUT_CRYPTO)
         on_rx_reinvite(_FakeApp("mandatory"), prm)
         self.assertEqual(prm.statusCode, 488)
 
-    def test_rejects_crypto_less_offer_when_srtp_optional(self):
+    def test_accepts_crypto_less_offer_when_srtp_optional(self):
+        # при optional гвард не применяется: возможна легитимная
+        # ренеготиация в plain RTP
         from common import on_rx_reinvite
         prm = _FakePrm(self.OFFER_WITHOUT_CRYPTO)
         on_rx_reinvite(_FakeApp("optional"), prm)
-        self.assertEqual(prm.statusCode, 488)
+        self.assertEqual(prm.statusCode, 200)
 
     def test_accepts_offer_with_crypto(self):
         from common import on_rx_reinvite
         prm = _FakePrm(self.OFFER_WITH_CRYPTO)
+        on_rx_reinvite(_FakeApp("mandatory"), prm)
+        self.assertEqual(prm.statusCode, 200)
+
+    def test_accepts_crypto_offer_with_text_media(self):
+        """Renegotiation adding T.140/red text media must proceed normally:
+        the audio validator ignores non-audio streams, so the guard must
+        not interfere with an offer that carries proper SRTP crypto."""
+        from common import on_rx_reinvite
+        prm = _FakePrm(self.OFFER_WITH_CRYPTO_AND_TEXT)
+        on_rx_reinvite(_FakeApp("mandatory"), prm)
+        self.assertEqual(prm.statusCode, 200)
+
+    def test_ignores_offerless_session_refresh(self):
+        """A re-INVITE without SDP body is a session refresh — never reject."""
+        from common import on_rx_reinvite
+        prm = _FakePrm(self.OFFERLESS_REFRESH)
         on_rx_reinvite(_FakeApp("mandatory"), prm)
         self.assertEqual(prm.statusCode, 200)
 

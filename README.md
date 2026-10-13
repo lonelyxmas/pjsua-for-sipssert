@@ -434,8 +434,9 @@ tasks:
 
 ## RTP/SRTP Echo Validation
 
-When used with `rtp_echo` on the remote side, pjsua-test performs byte-by-byte
-media stream verification:
+When used with `rtp_echo` on the remote side, pjsua-test performs pattern-based
+media stream verification (per-frame envelope check — see *Matching on receive*
+below):
 
 1. `EchoValidatorPort` generates frames cycling through a short sequence of
    well-separated μ-law-stable values (the cycle fits into the 64-value ring

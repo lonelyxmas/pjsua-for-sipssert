@@ -1292,15 +1292,22 @@ def on_rx_reinvite(app, prm, call=None):
     To restore it, schedule a re-anchor re-INVITE of our own (*call*):
     a fresh, fully-crypto offer re-synchronises the media leg and audio
     resumes on the same SRTP session.
+
+    The guard applies only to srtp=mandatory: with optional SRTP the
+    renegotiation can legitimately complete in plain RTP, and rejecting
+    crypto-less re-offers would break plain-RTP sessions.
     """
     srtp = str(getattr(app.args, "srtp", "") or "off")
-    if srtp not in ("mandatory", "optional"):
+    # Только mandatory: при optional гвард мог бы отклонять легитимные
+    # re-офферы plain-RTP-сессии (отклонение корректно лишь когда SRTP
+    # строго обязателен). Оффер без SDP (session refresh) не трогаем.
+    if srtp != "mandatory":
         return
     try:
         whole_msg = prm.rdata.wholeMsg or ""
     except Exception:
         whole_msg = ""
-    if "a=crypto" in whole_msg:
+    if "m=" not in whole_msg or "a=crypto" in whole_msg:
         return
     prm.statusCode = 488
     print("Re-INVITE offer without SRTP crypto — rejecting with 488, "
@@ -1308,9 +1315,17 @@ def on_rx_reinvite(app, prm, call=None):
     if call is None:
         return
 
+    # Single-flight: повторные crypto-less re-INVITE подряд не должны
+    # планировать перекрывающиеся ре-анкоры (glare на call.reinvite()).
+    now = time.monotonic()
+    if now - getattr(app, "_last_reanchor_at", 0.0) < 1.0:
+        print("Re-anchor skipped: one is already in flight.", file=sys.stderr)
+        return
+
     def _reanchor():
         """Re-anchor the media session with our own crypto re-INVITE."""
         try:
+            app._last_reanchor_at = time.monotonic()
             reinvite_prm = pj.CallOpParam(True)
             call.reinvite(reinvite_prm)
             print("Re-anchor re-INVITE sent.", file=sys.stderr)
