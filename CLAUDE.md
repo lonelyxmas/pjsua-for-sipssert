@@ -41,7 +41,7 @@ tests/                  — sipssert интеграционные тесты (14
   pjsua-options-ping/   — in-dialog OPTIONS ping (⚠ всегда FAIL — ограничение pjsua2, см. Known Issues README)
 ```
 
-Юнит-тесты (46 тестов, pure-python — запускаются ВНУТРИ контейнера, вне его
+Юнит-тесты (80 тестов, pure-python — запускаются ВНУТРИ контейнера, вне его
 нужен мок pjsua2):
 
 ```bash
@@ -55,7 +55,13 @@ docker run --rm --entrypoint python3 -v "$PWD/tests:/tests:ro" pjsua-test:new \
 - **scripts/common.py** — единый shared-модуль для всех скриптов; содержит EchoValidatorPort, HeaderManager, ConfigLoader, add_common_args и вспомогательные функции
 - **ConfigLoader** — загрузка YAML-конфига (`--config=FILE`); CLI-аргументы имеют приоритет; списки заголовков (`headers:`) объединяются (merge)
 - **HeaderManager** — управляет 8 типами проверок SIP-заголовков (set, expect, expect_not, expect_name_regex, expect_not_regex, expect_value, expect_value_regex, expect_count); поддерживает индексирование (Name[0], Name[-1]) и диапазоны count (N, N+, N-M)
-- **EchoValidatorPort** — кастомный `AudioMediaPort` для побайтового сравнения RTP/SRTP фреймов
+- **EchoValidatorPort** — кастомный `AudioMediaPort` для проверки RTP/SRTP:
+  детерминированные μ-law-stable паттерны, разделённые по направлениям (UAC —
+  низкая полоса амплитуд, UAS — высокая; окна матчинга не пересекаются →
+  детект перепутывания/подмены потоков), матчинг по медиане кадра с окном
+  аттенюации /12…+2%; PASS = match ≥ tolerance И received ≥ min_received_pct
+  (флор от «аудио умерло в середине вызова»); log_srtp_status предупреждает
+  о SDES-даунгрейде
 - **--bye=uac|uas|none** — контроль стороны отправки BYE; `--wait-bye` задаёт таймаут ожидания BYE от удалённой стороны
 - **--reinvite-by / --reinvite-delay** — отправка re-INVITE через заданные задержки; onCallMediaState переподключает EchoValidatorPort
 - **--options-ping / --options-auto-reply / --options-tolerance** — in-dialog OPTIONS keepalive с валидацией ответов; OptionsPingManager в common.py.
@@ -79,7 +85,8 @@ docker run --rm --entrypoint python3 -v "$PWD/tests:/tests:ro" pjsua-test:new \
   без обработчика ядро не доставляет SIGTERM вообще),
   tests/config.yml задаёт stop_timeout: 5
 - **Фазово-независимый эхо-паттерн + ре-анкор re-INVITE** (валидация RTP/SRTP):
-  паттерн `EchoValidatorPort` — короткий цикл (26 значений, оба знака) полностью
+  паттерн `EchoValidatorPort` — короткий цикл (по 6 значений на сторону:
+  UAC — низкая полоса, UAS — высокая; оба знака) полностью
   покрытый ring buffer 64; иначе одностороннее окно фазы выпадало при
   пересоздании медиа-сессии на re-INVITE и все кадры после него считались
   mismatch. Входящий re-INVITE без `a=crypto` (кейс rtpengine-passthrough)

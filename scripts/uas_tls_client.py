@@ -46,6 +46,7 @@ from common import (
     EchoValidatorPort,
     HeaderManager,
     init_endpoint,
+    log_srtp_status,
     OptionsPingManager,
     print_echo_results,
     print_options_results,
@@ -71,6 +72,7 @@ class App:
         self.account: UasAccount | None = None
         self.transport_id = None
         self.validator: EchoValidatorPort | None = None
+        self.role: str | None = None
         self.header_results = []
         self.call_completed = threading.Event()
         self.call_success = False
@@ -125,6 +127,7 @@ class UasCall(pj.Call):
         ci = self.getInfo()
         print(f"Call state: {ci.stateText}", file=sys.stderr)
         if ci.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            log_srtp_status(self, getattr(self.app.args, "srtp", "off"))
             self.timer = schedule_bye(self, self.app, "uas")
             self.app.reinvite_timers = schedule_reinvites(self, self.app, "uas")
             if self.app.options_mgr:
@@ -217,6 +220,7 @@ def main():
     header_mgr = HeaderManager(header_cfg)
 
     app = App(args, header_mgr)
+    app.role = "uas"
     apply_bye_default(args, "uas")
 
     rc = 1
@@ -285,7 +289,8 @@ def main():
             got_call = True
 
         # Evaluate results
-        echo_passed = print_echo_results(app.validator, args.tolerance)
+        echo_passed = print_echo_results(app.validator, args.tolerance,
+                                         getattr(args, "min_received_pct", None))
 
         header_passed = True
         if app.header_results:

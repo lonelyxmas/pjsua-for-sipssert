@@ -33,6 +33,7 @@ from common import (
     _apply_arg_defaults,
     init_endpoint,
     configure_srtp,
+    log_srtp_status,
     create_transport,
     safe_shutdown,
     safe_exit,
@@ -62,10 +63,11 @@ class App:
         self.args = args
         self.header_mgr = header_mgr
         self.ep = None
-        self.account = None
+        self.account: UacAccount | None = None
         self.transport_id = None
-        self.call = None
+        self.call: UacCall | None = None
         self.validator = None
+        self.role: str | None = None
         self.header_results = []
         self.call_completed = threading.Event()
         self.tls_ready = threading.Event()
@@ -83,7 +85,7 @@ class TlsServerEndpoint(pj.Endpoint):
 
     def __init__(self):
         super().__init__()
-        self.tls_ready_event = None
+        self.tls_ready_event: threading.Event | None = None
 
     def onTransportState(self, prm):
         if (self.tls_ready_event
@@ -139,6 +141,7 @@ class UacCall(pj.Call):
             return
         print(f"Call state: {ci.stateText}", file=sys.stderr)
         if ci.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            log_srtp_status(self, getattr(self.app.args, "srtp", "off"))
             self.timer = schedule_bye(self, self.app, "uac")
             self.app.reinvite_timers = schedule_reinvites(self, self.app, "uac")
             if self.app.options_mgr:
@@ -239,6 +242,7 @@ def main():
     header_mgr = HeaderManager(header_cfg)
 
     app = App(args, header_mgr)
+    app.role = "uac"
     apply_bye_default(args, "uac")
 
     rc = 1
@@ -320,7 +324,8 @@ def main():
 
         completed = wait_for_completion(app, "uac")
 
-        echo_ok = print_echo_results(app.validator, args.tolerance)
+        echo_ok = print_echo_results(app.validator, args.tolerance,
+                                     getattr(args, "min_received_pct", None))
 
         header_ok = True
         if app.header_results:

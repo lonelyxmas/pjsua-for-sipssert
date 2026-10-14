@@ -27,6 +27,7 @@ from common import (
     load_config_and_args,
     init_endpoint,
     configure_srtp,
+    log_srtp_status,
     create_transport,
     get_transport,
     get_transport_param,
@@ -59,12 +60,13 @@ class AppState:
         self.args = args
         self.header_mgr = header_mgr
         self.ep = None
-        self.account = None
+        self.account: UasAccount | None = None
         self.validator = None
         self.header_results = []
         self.call_completed = threading.Event()
         self.call_success = False
-        self.options_mgr = None
+        self.options_mgr: OptionsPingManager | None = None
+        self.role: str | None = None
         self.reinvite_timers = []
         self.active_call = None
 
@@ -116,6 +118,7 @@ class UasCall(pj.Call):
         print(f"Call state: {ci.stateText}", file=sys.stderr)
 
         if ci.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            log_srtp_status(self, getattr(self.app.args, "srtp", "off"))
             self.timer = schedule_bye(self, self.app, "uas")
             self.app.reinvite_timers = schedule_reinvites(
                 self, self.app, "uas")
@@ -175,6 +178,7 @@ def main():
     args, header_mgr = load_config_and_args("Standard SIP UAS (TLS server)")
 
     app = AppState(args, header_mgr)
+    app.role = "uas"
     _app = app
 
     apply_bye_default(args, "uas")
@@ -234,7 +238,8 @@ def main():
         got_call = True
 
     # --- Results ---
-    echo_passed = print_echo_results(app.validator, args.tolerance)
+    echo_passed = print_echo_results(app.validator, args.tolerance,
+                                     getattr(args, "min_received_pct", None))
 
     header_passed = True
     if app.header_results:

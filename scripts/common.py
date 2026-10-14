@@ -144,6 +144,21 @@ def _select_pattern_values(low=500, high=20000, growth=1.35, min_ratio=1.25):
 
 _STABLE_VALUES = _select_pattern_values()
 
+# Direction-specific patterns: UAC and UAS transmit from disjoint magnitude
+# bands. Match windows are [|v|/12, |v|*1.02], and the bands are chosen so
+# the two union windows never overlap: a validator can then attribute a
+# received frame to the remote leg only — a stream swap fails validation.
+#   UAC (A): mags from [500, 1200]   → window union ≈ [44, 1008]
+#   UAS (B): mags from [16000, 30000] → window union ≈ [1336, 30678]
+_VALUES_UAC = _select_pattern_values(low=500, high=1200)
+_VALUES_UAS = _select_pattern_values(low=16000, high=30000)
+
+# Echo PASS additionally requires that enough frames actually arrived:
+# received_pct >= MIN_RECEIVED_PCT_DEFAULT once sent >= FLOOR_MIN_SENT_FRAMES
+# (~1 s of audio; shorter calls are too noisy to judge). 0 disables the floor.
+MIN_RECEIVED_PCT_DEFAULT = 60.0
+FLOOR_MIN_SENT_FRAMES = 50
+
 
 class EchoValidatorPort(pj.AudioMediaPort):
     """
@@ -157,8 +172,17 @@ class EchoValidatorPort(pj.AudioMediaPort):
     RING_SIZE = 64
 
     def __init__(self, clock_rate=8000, channel_count=1,
-                 samples_per_frame=160, bits_per_sample=16):
+                 samples_per_frame=160, bits_per_sample=16,
+                 tx_values=None, peer_values=None):
+        """tx_values — pattern this port transmits; peer_values — the value
+        set the remote side transmits (received frames are matched against
+        it, enabling stream-swap detection). Defaults keep the legacy
+        behaviour: both = _STABLE_VALUES."""
         super().__init__()
+
+        self.tx_values = tx_values if tx_values is not None else _STABLE_VALUES
+        self.peer_values = (peer_values if peer_values is not None
+                            else self.tx_values)
 
         self.lock = threading.Lock()
         self.seq = 0
@@ -195,7 +219,7 @@ class EchoValidatorPort(pj.AudioMediaPort):
             size = 320  # 160 samples * 16-bit
 
         n_samples = size // 2
-        val = _STABLE_VALUES[self.seq % len(_STABLE_VALUES)]
+        val = self.tx_values[self.seq % len(self.tx_values)]
         data = struct.pack(f"<{n_samples}h", *([val] * n_samples))
 
         frame.buf = pj.ByteVector(data)
@@ -211,12 +235,13 @@ class EchoValidatorPort(pj.AudioMediaPort):
     SILENCE_THRESHOLD = 10
 
     def onFrameReceived(self, frame):
-        """Receive frame and match its median against sent values.
+        """Receive frame and match its median against the peer's value set.
 
         The conference bridge attenuates amplitude by ~3-8×, so we match
         by sign and proportional range: received median must have the same
-        sign as the sent value and |median| must be within [|sent|/12,
-        |sent|] (wide range to cover varying attenuation).
+        sign as a peer value and |median| must be within [|v|/12, |v|]
+        (wide range to cover varying attenuation). Matching against
+        peer_values (not own TX values) makes a swapped/mixed stream fail.
         """
         if frame.type != pj.PJMEDIA_FRAME_TYPE_AUDIO:
             return
@@ -238,7 +263,7 @@ class EchoValidatorPort(pj.AudioMediaPort):
 
             matched = False
             am = abs(median)
-            for sent_val in self.sent_ring:
+            for sent_val in self.peer_values:
                 if sent_val == 0:
                     continue
                 # Same sign?
@@ -283,12 +308,20 @@ class EchoValidatorPort(pj.AudioMediaPort):
                 match_pct = 0.0
             else:
                 match_pct = (self.frames_matched / total_checked) * 100.0
+            # RX frames come from the remote's TX; my own TX count over the
+            # same call is the proxy for what should have arrived here.
+            received_pct = 0.0
+            if self.frames_sent > 0:
+                received_pct = min(100.0,
+                                   self.frames_received / self.frames_sent * 100.0)
             return {
                 "sent": self.frames_sent,
                 "received": self.frames_received,
                 "matched": self.frames_matched,
                 "mismatched": self.frames_mismatched,
                 "match_pct": match_pct,
+                "received_pct": received_pct,
+                "loss_pct": max(0.0, 100.0 - received_pct),
             }
 
 
@@ -753,6 +786,7 @@ class ConfigLoader:
             "rtp_port": "rtp_port",
             "duration": "duration",
             "tolerance": "tolerance",
+            "min_received_pct": "min_received_pct",
             "wait_timeout": "wait_timeout",
             "tls_wait": "tls_wait",
             "srtp": "srtp",
@@ -901,6 +935,9 @@ def add_common_args(parser: argparse.ArgumentParser):
                         help="Call duration in seconds (default: 10)")
     parser.add_argument("--tolerance", type=float, default=None,
                         help="Minimum match percentage to pass (default: 90)")
+    parser.add_argument("--min-received-pct", type=float, default=None,
+                        help="Minimum received rate (%% of sent frames) to pass; "
+                             "0 disables (default: 60)")
     parser.add_argument("--wait-timeout", type=int, default=None,
                         help="Max seconds to wait for incoming call (default: 30)")
     parser.add_argument("--tls-wait", type=int, default=None,
@@ -1390,7 +1427,12 @@ def reconnect_media(call, app, mi_idx):
         # Initial INVITE: create new validator
         print(f"Audio media active (stream {mi_idx}). Connecting echo validator...",
               file=sys.stderr)
-        validator = EchoValidatorPort()
+        validator = EchoValidatorPort(tx_values=_VALUES_UAC,
+                                      peer_values=_VALUES_UAS) if getattr(
+            app, "role", None) == "uac" else (
+            EchoValidatorPort(tx_values=_VALUES_UAS,
+                              peer_values=_VALUES_UAC) if getattr(
+                app, "role", None) == "uas" else EchoValidatorPort())
         validator.register("echo-validator")
         app.validator = validator
 
@@ -1406,14 +1448,71 @@ def reconnect_media(call, app, mi_idx):
 # Echo result helpers
 # ---------------------------------------------------------------------------
 
-def print_echo_results(validator: EchoValidatorPort, tolerance: float) -> bool:
+def echo_passed(stats: dict, tolerance: float,
+                min_received_pct: float | None = MIN_RECEIVED_PCT_DEFAULT) -> bool:
+    """
+    Decide echo PASS/FAIL from validator stats. Two conditions:
+      - match_pct >= tolerance: the audio that arrived was plausible, and
+      - received_pct >= min_received_pct once sent >= FLOOR_MIN_SENT_FRAMES:
+        enough audio actually arrived (a stream that dies mid-call no longer
+        passes on early matched frames). min_received_pct=0 disables the
+        floor; calls shorter than FLOOR_MIN_SENT_FRAMES skip it.
+    """
+    if stats["match_pct"] < tolerance:
+        return False
+    if min_received_pct is None:
+        min_received_pct = MIN_RECEIVED_PCT_DEFAULT
+    if min_received_pct <= 0 or stats.get("sent", 0) < FLOOR_MIN_SENT_FRAMES:
+        return True
+    return stats.get("received_pct", 0.0) >= min_received_pct
+
+
+def srtp_status_line(srtp_mode, rem_sdp: str | None) -> str:
+    """Human-readable SRTP negotiation status.
+
+    rem_sdp: None — remote SDP is not exposed by this pjsua2 build
+    (CallInfo has no SDP fields); empty string — SDP available but has no
+    a=crypto line (the true downgrade signal for srtp=optional); otherwise
+    the remote SDP text. srtp=mandatory is always ACTIVE on a confirmed call:
+    pjproject refuses to establish the media without negotiated crypto.
+    """
+    mode = (srtp_mode or "off").lower()
+    if mode == "off":
+        return "SRTP: off — media is plain RTP."
+    if mode == "mandatory":
+        return ("SRTP: ACTIVE (srtp=mandatory — pjproject would have failed "
+                "the call without negotiated crypto).")
+    if rem_sdp is None:
+        return ("SRTP: optional — negotiated state is not exposed by pjsua2; "
+                "see the 'SRTP status' lines in the pjlib log.")
+    if "a=crypto" in rem_sdp:
+        return "SRTP: ACTIVE (srtp=optional, remote SDP has a=crypto)."
+    return (f"WARNING: srtp={mode} but remote SDP has no a=crypto — "
+            "media will be plain RTP (SDES stripped or downgraded?).")
+
+
+def log_srtp_status(call, srtp_mode) -> None:
+    """Print SRTP negotiation status for a confirmed call. Never raises."""
+    try:
+        ci = call.getInfo()
+        line = srtp_status_line(srtp_mode, getattr(ci, "remSdp", None))
+        print(line, file=sys.stderr)
+    except Exception as e:
+        print(f"SRTP status check failed: {e}", file=sys.stderr)
+
+
+def print_echo_results(validator: EchoValidatorPort | None, tolerance: float,
+                       min_received_pct: float | None = None) -> bool:
     """
     Print echo validation stats to stderr.
-    Returns True if match_pct >= tolerance.
+    Returns True if echo_passed(stats, tolerance, min_received_pct).
     """
     if validator is None:
         print("NO MEDIA — validator was never connected.", file=sys.stderr)
         return False
+
+    if min_received_pct is None:
+        min_received_pct = MIN_RECEIVED_PCT_DEFAULT
 
     stats = validator.get_stats()
     print(f"\n{'=' * 50}", file=sys.stderr)
@@ -1423,9 +1522,13 @@ def print_echo_results(validator: EchoValidatorPort, tolerance: float) -> bool:
     print(f"  Frames matched:    {stats['matched']}", file=sys.stderr)
     print(f"  Frames mismatched: {stats['mismatched']}", file=sys.stderr)
     print(f"  Match rate:        {stats['match_pct']:.1f}%", file=sys.stderr)
-    print(f"  Tolerance:         {tolerance}%", file=sys.stderr)
+    print(f"  Received rate:     {stats['received_pct']:.1f}% of sent frames",
+          file=sys.stderr)
+    print(f"  Loss rate:         {stats['loss_pct']:.1f}%", file=sys.stderr)
+    print(f"  Tolerance:         {tolerance}% match / {min_received_pct}% received",
+          file=sys.stderr)
 
-    passed = stats["match_pct"] >= tolerance
+    passed = echo_passed(stats, tolerance, min_received_pct)
     print(f"  RESULT: {'PASS' if passed else 'FAIL'}", file=sys.stderr)
     print(f"{'=' * 50}\n", file=sys.stderr)
     return passed
@@ -1468,6 +1571,7 @@ _ARG_DEFAULTS = {
     "srtp_secure": 0,
     "duration": 10,
     "tolerance": 90.0,
+    "min_received_pct": 60.0,
     "wait_timeout": 30,
     "tls_wait": 10,
     "wait_bye": 30,

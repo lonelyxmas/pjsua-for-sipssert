@@ -21,6 +21,12 @@ from common import (
     _build_ulaw_quantize_table,
     _build_stable_values,
     _STABLE_VALUES,
+    _VALUES_UAC,
+    _VALUES_UAS,
+    MIN_RECEIVED_PCT_DEFAULT,
+    FLOOR_MIN_SENT_FRAMES,
+    echo_passed,
+    srtp_status_line,
     configure_srtp,
     ConfigLoader,
     HeaderManager,
@@ -177,6 +183,7 @@ class TestConfigLoaderMerge(unittest.TestCase):
             bye=None, wait_bye=None, dest_uri=None,
             rtp_port=None, options_ping=None,
             options_auto_reply=None, options_tolerance=None,
+            min_received_pct=None,
             reinvite_by=None, reinvite_delay=None,
             ruri_user=None, from_user=None,
         )
@@ -194,6 +201,11 @@ class TestConfigLoaderMerge(unittest.TestCase):
         ConfigLoader.merge({"duration": 20, "proxy": "1.2.3.4:5060"}, args)
         self.assertEqual(args.duration, 20)
         self.assertEqual(args.proxy, "1.2.3.4:5060")
+
+    def test_min_received_pct_mapping(self):
+        args = self._make_args()
+        ConfigLoader.merge({"min_received_pct": 70}, args)
+        self.assertEqual(args.min_received_pct, 70)
 
     def test_cli_takes_precedence(self):
         args = self._make_args(duration=5)
@@ -462,6 +474,46 @@ class TestEchoValidatorPort(unittest.TestCase):
         f.type = pj.PJMEDIA_FRAME_TYPE_AUDIO
         return f
 
+    def test_direction_validation_matches_peer_set_only(self):
+        """A UAC-side validator must accept UAS-set frames and reject its own
+        set coming back (stream swap detection)."""
+        from common import EchoValidatorPort, _VALUES_UAC, _VALUES_UAS
+        v = EchoValidatorPort(tx_values=_VALUES_UAC, peer_values=_VALUES_UAS)
+        v.register("direction-test")
+
+        peer_frame = self._received_frame(_VALUES_UAS[0])   # peer's TX — match
+        v.onFrameReceived(peer_frame)
+        own_frame = self._received_frame(_VALUES_UAC[0])    # own TX echoed — mismatch
+        v.onFrameReceived(own_frame)
+
+        stats = v.get_stats()
+        self.assertEqual(stats["matched"], 1,
+                         "Frame from the peer's set must match")
+        self.assertEqual(stats["mismatched"], 1,
+                         "Own set echoed back must mismatch (swap detection)")
+
+    def test_stats_report_received_pct_and_loss(self):
+        from common import EchoValidatorPort, _STABLE_VALUES
+        v = EchoValidatorPort()
+        v.register("pct-test")
+
+        for _ in range(10):
+            v.onFrameRequested(self._make_frame())
+        for _ in range(5):
+            v.onFrameReceived(self._received_frame(_STABLE_VALUES[0]))
+
+        stats = v.get_stats()
+        self.assertEqual(stats["sent"], 10)
+        self.assertEqual(stats["received"], 5)
+        self.assertAlmostEqual(stats["received_pct"], 50.0)
+        self.assertAlmostEqual(stats["loss_pct"], 50.0)
+
+    def test_default_validator_uses_stable_values(self):
+        from common import EchoValidatorPort, _STABLE_VALUES
+        v = EchoValidatorPort()
+        self.assertEqual(v.tx_values, _STABLE_VALUES)
+        self.assertEqual(v.peer_values, _STABLE_VALUES)
+
     @staticmethod
     def _make_frame_raw(size=320):
         class FakeFrame:
@@ -685,6 +737,139 @@ class TestOnRxReinvite(unittest.TestCase):
         prm = _FakePrm(self.OFFER_WITHOUT_CRYPTO)
         on_rx_reinvite(_FakeApp("off"), prm)
         self.assertEqual(prm.statusCode, 200)
+
+
+# -----------------------------------------------------------------------
+# Direction-specific pattern sets (_VALUES_UAC / _VALUES_UAS)
+# -----------------------------------------------------------------------
+
+class TestDirectionPatterns(unittest.TestCase):
+
+    def test_both_direction_sets_exist_and_nonempty(self):
+        self.assertTrue(len(_VALUES_UAC) > 0, "UAC pattern set must not be empty")
+        self.assertTrue(len(_VALUES_UAS) > 0, "UAS pattern set must not be empty")
+
+    def test_direction_sets_are_ulaw_fixed_points(self):
+        stable = set(_build_stable_values())
+        for v in _VALUES_UAC + _VALUES_UAS:
+            self.assertIn(v, stable, f"Value {v} is not a μ-law fixed point")
+
+    def test_direction_sets_have_both_signs(self):
+        for name, vals in (("UAC", _VALUES_UAC), ("UAS", _VALUES_UAS)):
+            self.assertTrue(any(v > 0 for v in vals), f"{name} set lacks positive values")
+            self.assertTrue(any(v < 0 for v in vals), f"{name} set lacks negative values")
+
+    def test_direction_cycle_fits_ring(self):
+        # EchoValidatorPort.RING_SIZE = 64 (kept in sync without pjsua2 import,
+        # same as test_pattern_cycle_fits_ring_buffer)
+        ring_size = 64
+        self.assertLessEqual(len(_VALUES_UAC), ring_size)
+        self.assertLessEqual(len(_VALUES_UAS), ring_size)
+
+    def test_direction_match_windows_disjoint(self):
+        """Attenuation match windows of the two sets must not overlap.
+
+        A received frame can match a sent value v when it has the same sign
+        and |median| is within [|v|/12, |v|*1.02]. For direction attribution
+        the union windows of the two sets must stay disjoint.
+        """
+        a_lo = min(abs(v) for v in _VALUES_UAC) / 12
+        a_hi = max(abs(v) for v in _VALUES_UAC) * 1.02
+        b_lo = min(abs(v) for v in _VALUES_UAS) / 12
+        b_hi = max(abs(v) for v in _VALUES_UAS) * 1.02
+        self.assertLess(a_hi, b_lo,
+                        f"UAC window [{a_lo:.0f}, {a_hi:.0f}] overlaps "
+                        f"UAS window [{b_lo:.0f}, {b_hi:.0f}]")
+
+
+# -----------------------------------------------------------------------
+# echo_passed — PASS/FAIL decision with received-floor
+# -----------------------------------------------------------------------
+
+class TestEchoPassed(unittest.TestCase):
+
+    @staticmethod
+    def _stats(**kw):
+        stats = {
+            "sent": 500, "received": 400, "matched": 380,
+            "mismatched": 20, "match_pct": 95.0,
+            "received_pct": 80.0, "loss_pct": 20.0,
+        }
+        stats.update(kw)
+        return stats
+
+    def test_pass_when_match_and_floor_ok(self):
+        self.assertTrue(echo_passed(self._stats(), 90.0, MIN_RECEIVED_PCT_DEFAULT))
+
+    def test_fail_when_match_below_tolerance(self):
+        self.assertFalse(echo_passed(self._stats(match_pct=89.9), 90.0, 60.0))
+
+    def test_fail_when_received_below_floor(self):
+        """Audio died mid-call: match is 100% of received, but too few received."""
+        stats = self._stats(match_pct=100.0, received_pct=50.0)
+        self.assertFalse(echo_passed(stats, 90.0, 60.0))
+
+    def test_floor_exactly_at_limit_passes(self):
+        stats = self._stats(received_pct=60.0)
+        self.assertTrue(echo_passed(stats, 90.0, 60.0))
+
+    def test_floor_skipped_for_short_calls(self):
+        """Very short calls (< FLOOR_MIN_SENT_FRAMES sent) skip the floor."""
+        stats = self._stats(sent=30, received_pct=0.0)
+        self.assertTrue(echo_passed(stats, 90.0, 60.0))
+
+    def test_floor_disabled_by_zero(self):
+        stats = self._stats(received_pct=5.0)
+        self.assertTrue(echo_passed(stats, 90.0, 0))
+
+    def test_floor_constant_is_about_one_second(self):
+        """50 frames x 20 ms = 1 s of audio."""
+        self.assertEqual(FLOOR_MIN_SENT_FRAMES, 50)
+
+
+# -----------------------------------------------------------------------
+# srtp_status_line — SRTP downgrade visibility
+# -----------------------------------------------------------------------
+
+class TestSrtpStatusLine(unittest.TestCase):
+
+    SDP_WITH_CRYPTO = (
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n"
+        "m=audio 16000 RTP/AVP 0\r\n"
+        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:abcdef\r\n"
+    )
+    SDP_WITHOUT_CRYPTO = "v=0\r\nm=audio 16000 RTP/AVP 0\r\n"
+
+    def test_active_when_crypto_present(self):
+        line = srtp_status_line("mandatory", self.SDP_WITH_CRYPTO)
+        self.assertIn("ACTIVE", line)
+
+    def test_warning_when_crypto_missing(self):
+        """SDP present but plain — the true downgrade signal (srtp=optional)."""
+        line = srtp_status_line("optional", self.SDP_WITHOUT_CRYPTO)
+        self.assertIn("WARNING", line)
+        self.assertIn("plain RTP", line)
+
+    def test_mandatory_is_active_on_confirmed_call(self):
+        """pjproject fails the call when mandatory crypto cannot be agreed —
+        a confirmed call means SRTP is active, regardless of SDP access."""
+        line = srtp_status_line("mandatory", None)
+        self.assertIn("ACTIVE", line)
+
+    def test_optional_without_sdp_access_is_neutral(self):
+        """pjsua2 may not expose remSdp — never warn without evidence."""
+        line = srtp_status_line("optional", None)
+        self.assertNotIn("WARNING", line)
+        self.assertIn("optional", line)
+
+    def test_off_mode_reports_plain(self):
+        line = srtp_status_line("off", self.SDP_WITH_CRYPTO)
+        self.assertIn("off", line)
+        self.assertIn("plain RTP", line)
+
+    def test_none_mode_treated_as_off(self):
+        line = srtp_status_line(None, "")
+        self.assertIn("off", line)
 
 
 if __name__ == "__main__":

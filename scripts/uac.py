@@ -14,31 +14,32 @@ What this script does:
   8. Exits with code 0 (pass) or 1 (fail)
 """
 
+import argparse
 import sys
 import threading
 
 sys.path.insert(0, "/scripts")
 
 from common import (
-    on_rx_reinvite,
-    load_config_and_args,
-    init_endpoint,
+    apply_bye_default,
     configure_srtp,
     create_transport,
+    get_default_port,
     get_transport,
     get_transport_param,
-    get_default_port,
-    safe_shutdown,
-    safe_exit,
+    HeaderManager,
+    init_endpoint,
+    load_config_and_args,
+    log_srtp_status,
+    on_rx_reinvite,
+    OptionsPingManager,
     print_echo_results,
     print_options_results,
-    EchoValidatorPort,
-    HeaderManager,
-    OptionsPingManager,
-    apply_bye_default,
+    reconnect_media,
+    safe_exit,
+    safe_shutdown,
     schedule_bye,
     schedule_reinvites,
-    reconnect_media,
     wait_for_completion,
 )
 
@@ -51,10 +52,14 @@ import pjsua2 as pj
 
 class App:
     def __init__(self):
+        self.args: argparse.Namespace | None = None
         self.ep = None
-        self.account = None
-        self.call = None
+        self.account: UacAccount | None = None
+        self.call: UacCall | None = None
         self.validator = None
+        self.role: str | None = None
+        self.options_mgr: OptionsPingManager | None = None
+        self.header_mgr: HeaderManager | None = None
         self.call_completed = threading.Event()
         self.header_results = []
         self.call_success = False
@@ -91,6 +96,7 @@ class UacCall(pj.Call):
         print(f"Call state: {ci.stateText}", file=sys.stderr)
 
         if ci.state == pj.PJSIP_INV_STATE_CONFIRMED:
+            log_srtp_status(self, getattr(self.app.args, "srtp", "off"))
             self.timer = schedule_bye(self, self.app, "uac")
             self.app.reinvite_timers = schedule_reinvites(
                 self, self.app, "uac")
@@ -154,6 +160,7 @@ def main():
     app = App()
     app.args = args
     app.header_mgr = header_mgr
+    app.role = "uac"
 
     apply_bye_default(args, "uac")
 
@@ -221,7 +228,8 @@ def main():
 
         completed = wait_for_completion(app, "uac")
 
-        echo_ok = print_echo_results(app.validator, getattr(args, "tolerance", 90.0))
+        echo_ok = print_echo_results(app.validator, getattr(args, "tolerance", 90.0),
+                                     getattr(args, "min_received_pct", None))
 
         header_ok = True
         if app.header_results:

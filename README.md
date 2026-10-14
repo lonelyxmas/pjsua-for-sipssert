@@ -8,14 +8,15 @@ in scenarios where SIPp has architectural limitations.
 
 ## Motivation
 
-SIPp (v3.7) has several issues that cannot be resolved without patching the source code:
+SIPp has several issues that cannot be resolved without patching the source code
+(status re-checked against v3.8.0):
 
-| Problem | Root cause in SIPp | Solution in pjsua-test |
-|---|---|---|
-| Poor SRTP validation performance | Custom JLSRTP implementation: excessive `std::vector` allocations, global mutexes, no zero-copy | PJSIP uses libsrtp2 with in-place encryption |
-| TLS role is tied to SIP role | UAC = TLS client, UAS = TLS server, hardcoded in `sslsocket.cpp` | PJSUA2 API allows arbitrary role combinations |
-| Global SRTP contexts | Single key set for all calls | Per-call SRTP contexts |
-| No DTLS-SRTP | SDES only | PJSIP supports both SDES and DTLS-SRTP |
+| Problem | Root cause in SIPp | Solution in pjsua-test | SIPp 3.8.0 |
+|---|---|---|---|
+| Poor SRTP validation performance | Custom JLSRTP implementation: excessive `std::vector` allocations, global mutexes, no zero-copy | PJSIP uses libsrtp2 with in-place encryption | ⚠️ improved (AES/HMAC set up once per stream instead of per packet: 1/6 less CPU, 1/3 less memory), but still JLSRTP, not libsrtp |
+| TLS role is tied to SIP role | UAC = TLS client, UAS = TLS server, hardcoded in `sslsocket.cpp` | PJSUA2 API allows arbitrary role combinations | ❌ not fixed: `SSL_connect` is still bound to the outgoing socket and `SSL_accept` to accepted ones (`socket.cpp`) |
+| Global SRTP contexts | Single key set for all calls | Per-call SRTP contexts | ✅ fixed: per-call SRTP keys (#1002), per-call `rtp_echo` |
+| No DTLS-SRTP | SDES only | PJSIP supports both SDES and DTLS-SRTP | ❌ the core is still SDES-only; DTLS-SRTP exists only as an external Python probe in `tools/` |
 
 ## Building
 
@@ -61,6 +62,7 @@ ruri_user: test       # user part of Request-URI
 from_user: uac        # user part of From header
 duration: 10          # call duration, sec
 tolerance: 90         # min match % for PASS (echo validation)
+min_received_pct: 60  # min % of sent frames that must arrive (0 = off)
 wait_timeout: 30      # timeout for incoming call, sec (uas-tls-client)
 tls_wait: 10          # timeout for TLS connection, sec (uac-tls-server)
 srtp: mandatory       # off | optional | mandatory
@@ -468,7 +470,8 @@ Exit code: `0` = PASS, `1` = FAIL. Compatible with sipssert (exit code determine
 
 Exit code `0` requires **all** of the following:
 - **Call completed** — call was established and terminated normally
-- **Echo validation** — RTP match rate ≥ `--tolerance` (default 90%), or no media was expected
+- **Echo validation** — RTP match rate ≥ `--tolerance` (default 90%) and received
+  rate ≥ `--min-received-pct` (default 60% of sent frames), or no media was expected
 - **Header checks** — all `--expect-header*` checks passed (if configured)
 - **OPTIONS ping** — success rate ≥ `--options-tolerance` (default 90%), if `--options-ping` is configured
 
@@ -517,8 +520,19 @@ Both formats are supported: `--key=value` and `--key value`.
 | Parameter | Description | Default |
 |---|---|---|
 | `--tolerance` | Minimum match percentage for PASS | 90 |
+| `--min-received-pct` | Minimum received rate (% of sent frames) for PASS; 0 disables | 60 |
 | `--wait-timeout` | Timeout for incoming call, sec (uas-tls-client) | 30 |
 | `--tls-wait` | Timeout for TLS connection, sec (uac-tls-server) | 10 |
+
+**Trust boundary:** the validation proves **end-to-end media liveness and SRTP
+decryptability** — audio actually flowed both ways, survived the codec, and
+with `srtp: mandatory` decrypted with the correct key (a wrong key makes
+libsrtp drop packets → silence → mismatch). It is **not** a byte-exact
+content check: received frames are matched by median amplitude against the
+peer's value set (attenuation window /12…+2%), so a different signal of
+similar amplitude would still pass. Packet loss alone does not fail the test —
+it lowers the received rate; the `--min-received-pct` floor (default 60%,
+applied from ~1 s of audio) catches streams that die mid-call.
 
 **How it works:**
 
